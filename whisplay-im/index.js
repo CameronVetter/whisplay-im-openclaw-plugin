@@ -867,7 +867,7 @@ const whisplayImChannel = {
                                 lastError: null,
                             });
                         } else {
-                            ctx.log?.warn?.(
+                            ctx.log?.trace?.(
                                 `[${ctx.accountId}] poll active: no inbound messages yet (ticks=${pollTick})`,
                             );
                         }
@@ -875,7 +875,7 @@ const whisplayImChannel = {
                         if (isAborted()) {
                             break;
                         }
-                        ctx.log?.warn?.(
+                        ctx.log?.trace?.(
                             `[${ctx.accountId}] poll loop error: ${error instanceof Error ? error.message : String(error)}`,
                         );
                         ctx.setStatus({
