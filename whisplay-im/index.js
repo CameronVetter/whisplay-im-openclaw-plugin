@@ -14,7 +14,7 @@ const INBOUND_CACHE_LIMIT = 512;
 const pairingRelaySeen = new Map();
 const inboundSeenByAccount = new Map();
 const pollTickByAccount = new Map();
-let getReplyFromConfigLoader = null;
+let dispatchInboundMessageLoader = null;
 
 async function fileExists(filePath) {
     try {
@@ -59,31 +59,22 @@ async function resolvePluginSdkIndexPath() {
     );
 }
 
-async function resolvePluginSdkReplyBundlePath() {
+async function resolveDispatchInboundMessageFn() {
     const indexPath = await resolvePluginSdkIndexPath();
     const sdkDir = path.dirname(indexPath);
-    const entries = await fs.readdir(sdkDir, { withFileTypes: true });
-    // Try reply-*.js first, then thread-bindings-*.js (new SDK layout)
-    const patterns = [/^reply-.*\.js$/, /^thread-bindings-.*\.js$/];
-    for (const pattern of patterns) {
-        const candidates = entries
-            .filter((entry) => entry.isFile() && pattern.test(entry.name))
-            .map((entry) => path.join(sdkDir, entry.name))
-            .sort();
-        if (candidates.length > 0) return candidates[0];
+
+    // Try the dedicated reply-runtime entrypoint first (stable SDK subpath).
+    const replyRuntimePath = path.join(sdkDir, "reply-runtime.js");
+    if (await fileExists(replyRuntimePath)) {
+        const replyModule = await import(pathToFileURL(replyRuntimePath).href);
+        if (typeof replyModule.dispatchInboundMessageWithDispatcher === "function") {
+            return replyModule.dispatchInboundMessageWithDispatcher;
+        }
     }
 
-    throw new Error(`no reply bundle found under plugin-sdk dir: ${sdkDir}`);
-}
-
-async function resolveGetReplyFromConfigFn() {
-    const indexPath = await resolvePluginSdkIndexPath();
-    const sdkDir = path.dirname(indexPath);
+    // Fall back to scanning all SDK bundle files.
     const entries = await fs.readdir(sdkDir, { withFileTypes: true });
-
-    // Search reply-*.js first (legacy), then thread-bindings-*.js (new SDK layout),
-    // then any remaining .js bundles as fallback.
-    const priorityPatterns = [/^reply-.*\.js$/, /^thread-bindings-.*\.js$/];
+    const priorityPatterns = [/^reply-runtime\.js$/, /^reply-.*\.js$/];
     const priorityCandidates = [];
     const fallbackCandidates = [];
     for (const entry of entries) {
@@ -101,32 +92,27 @@ async function resolveGetReplyFromConfigFn() {
     const diagnostics = [];
     for (const candidate of candidates) {
         const replyModule = await import(pathToFileURL(candidate).href);
-        const byName = Object.values(replyModule).find(
-            (value) => typeof value === "function" && value.name === "getReplyFromConfig",
-        );
-        const fnNames = Object.values(replyModule)
-            .filter((value) => typeof value === "function")
-            .map((value) => value.name)
-            .filter(Boolean)
+        if (typeof replyModule.dispatchInboundMessageWithDispatcher === "function") {
+            return replyModule.dispatchInboundMessageWithDispatcher;
+        }
+        const fnNames = Object.keys(replyModule)
+            .filter((key) => typeof replyModule[key] === "function")
             .slice(0, 10)
             .join(",");
         diagnostics.push(`${path.basename(candidate)}:${fnNames}`);
-        if (typeof byName === "function") {
-            return byName;
-        }
     }
 
     throw new Error(
-        `plugin-sdk getReplyFromConfig export is unavailable ` +
+        `plugin-sdk dispatchInboundMessageWithDispatcher export is unavailable ` +
         `(inspected=${diagnostics.join("|")})`,
     );
 }
 
-function normalizeReplyPayloads(payload) {
-    if (!payload) {
-        return [];
+async function loadDispatchInboundMessage() {
+    if (!dispatchInboundMessageLoader) {
+        dispatchInboundMessageLoader = resolveDispatchInboundMessageFn();
     }
-    return Array.isArray(payload) ? payload.filter(Boolean) : [payload];
+    return dispatchInboundMessageLoader;
 }
 
 function payloadToReplyText(payload) {
@@ -208,26 +194,6 @@ function sanitizeSessionPart(value) {
         .replace(/-+/g, "-")
         .replace(/^-|-$/g, "")
         .slice(0, 96);
-}
-
-async function loadGetReplyFromConfig() {
-    if (!getReplyFromConfigLoader) {
-        getReplyFromConfigLoader = (async () => {
-            const resolvedByProbe = await resolveGetReplyFromConfigFn();
-            if (typeof resolvedByProbe === "function") {
-                return resolvedByProbe;
-            }
-
-            const replyBundlePath = await resolvePluginSdkReplyBundlePath();
-            const replyModule = await import(pathToFileURL(replyBundlePath).href);
-            if (typeof replyModule?.t === "function") {
-                return replyModule.t;
-            }
-
-            throw new Error("plugin-sdk getReplyFromConfig export is unavailable");
-        })();
-    }
-    return getReplyFromConfigLoader;
 }
 
 function getPairingSeenSet(accountId) {
@@ -664,6 +630,17 @@ function normalizeInboundItems(payload) {
     return results;
 }
 
+function resolveReplyPayloadFields(payload) {
+    const text = String(payload?.text ?? "").trim();
+    const mediaUrl = String(payload?.mediaUrl ?? "").trim();
+    const mediaUrls = Array.isArray(payload?.mediaUrls)
+        ? payload.mediaUrls.map((v) => String(v ?? "").trim()).filter(Boolean)
+        : [];
+    const firstMediaUrl = mediaUrl || (mediaUrls.length > 0 ? mediaUrls[0] : "");
+    const replyText = text || (firstMediaUrl ? "" : payloadToReplyText(payload));
+    return { replyText, firstMediaUrl };
+}
+
 async function emitInboundToGateway(ctx, inbound) {
     const peer = resolveInboundPeer(inbound);
     const senderId = peer.id;
@@ -700,7 +677,7 @@ async function emitInboundToGateway(ctx, inbound) {
     const baseUrl = normalizeBaseUrl(ctx.account?.ip);
     const accountToken = ctx.account?.token;
 
-    const getReplyFromConfig = await loadGetReplyFromConfig();
+    const dispatchInboundMessage = await loadDispatchInboundMessage();
 
     // Send "thinking" status before agent processes the message
     await sendStatus(baseUrl, accountToken, "thinking", { emoji: "🤔", text: inbound.text.slice(0, 80) });
@@ -722,44 +699,47 @@ async function emitInboundToGateway(ctx, inbound) {
         }
     });
 
-    let replyPayload;
+    let sentCount = 0;
     try {
-        replyPayload = await getReplyFromConfig(inboundCtx, undefined, ctx.cfg);
+        await dispatchInboundMessage({
+            ctx: inboundCtx,
+            cfg: ctx.cfg,
+            dispatcherOptions: {
+                deliver: async (payload) => {
+                    const { replyText, firstMediaUrl } = resolveReplyPayloadFields(payload);
+
+                    // Convert media URL to base64 if present
+                    let imageBase64 = "";
+                    if (firstMediaUrl) {
+                        await sendStatus(baseUrl, accountToken, "tool_calling", {
+                            emoji: "🖼️",
+                            tool: "fetchImage",
+                            text: "Downloading image...",
+                        });
+                        imageBase64 = await fetchImageAsBase64(firstMediaUrl);
+                    }
+
+                    // Skip empty replies (no text and no image to send)
+                    if (!replyText && !imageBase64) {
+                        return;
+                    }
+
+                    // Send "answering" status before delivering the reply
+                    if (replyText) {
+                        await sendStatus(baseUrl, accountToken, "answering");
+                    }
+                    await sendReply(baseUrl, accountToken, replyText, imageBase64 || undefined);
+                    sentCount += 1;
+                },
+                onError: (err, info) => {
+                    ctx.log?.warn?.(
+                        `[${ctx.accountId}] Failed to deliver reply (${info?.kind ?? "unknown"}): ${err instanceof Error ? err.message : String(err)}`,
+                    );
+                },
+            },
+        });
     } finally {
         logWatcher.stop();
-    }
-    const replies = normalizeReplyPayloads(replyPayload);
-    let sentCount = 0;
-    for (const payload of replies) {
-        const text = String(payload?.text ?? "").trim();
-        const mediaUrl = String(payload?.mediaUrl ?? "").trim();
-        const mediaUrls = Array.isArray(payload?.mediaUrls)
-            ? payload.mediaUrls.map((v) => String(v ?? "").trim()).filter(Boolean)
-            : [];
-        const firstMediaUrl = mediaUrl || (mediaUrls.length > 0 ? mediaUrls[0] : "");
-        const replyText = text || (firstMediaUrl ? "" : payloadToReplyText(payload));
-
-        // Convert media URL to base64 if present
-        let imageBase64 = "";
-        if (firstMediaUrl) {
-            await sendStatus(baseUrl, accountToken, "tool_calling", {
-                emoji: "🖼️",
-                tool: "fetchImage",
-                text: "Downloading image...",
-            });
-            imageBase64 = await fetchImageAsBase64(firstMediaUrl);
-        }
-
-        if (!replyText && !imageBase64) {
-            continue;
-        }
-
-        // Send "answering" status before delivering the reply
-        if (replyText) {
-            await sendStatus(baseUrl, accountToken, "answering");
-        }
-        await sendReply(baseUrl, accountToken, replyText, imageBase64 || undefined);
-        sentCount += 1;
     }
 
     // Send "idle" status after all replies are delivered
@@ -777,7 +757,7 @@ async function emitInboundToGateway(ctx, inbound) {
         });
     }
 
-    return "plugin-sdk.auto-reply.getReplyFromConfig";
+    return "plugin-sdk.auto-reply.dispatchInboundMessage";
 }
 
 async function relayGatewayPairingHints({ accountId, baseUrl, token, log, notBeforeMs }) {
@@ -975,9 +955,9 @@ const whisplayImChannel = {
             }
 
             const isAborted = () => Boolean(ctx.abortSignal && ctx.abortSignal.aborted);
-            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher source: plugin-sdk.auto-reply.getReplyFromConfig`);
-            await loadGetReplyFromConfig();
-            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher preflight: getReplyFromConfig ready`);
+            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher source: plugin-sdk.auto-reply.dispatchInboundMessage`);
+            await loadDispatchInboundMessage();
+            ctx.log?.warn?.(`[${ctx.accountId}] inbound dispatcher preflight: dispatchInboundMessage ready`);
             ctx.setStatus({
                 accountId: ctx.accountId,
                 configured: true,
